@@ -1,0 +1,788 @@
+#!/usr/bin/env bash
+# cmd-core — Kern von »cmd«: übersetzt natürliche Sprache in Shell-Befehle
+# (via Claude Code CLI im Print-Modus).
+#
+# Wird normalerweise von der Shell-Funktion cmd() (cmd.sh) aufgerufen, die
+# CMD_RESULT_FILE auf eine mktemp-Datei setzt. Bestätigt der Nutzer eine
+# Option, schreibt dieses Skript den finalen Befehl in diese Datei und endet
+# mit Exit-Code 0; die Shell-Funktion führt ihn dann in der AKTUELLEN Shell
+# aus (damit cd/export wirken).
+#
+# Dieses Skript führt generierte Befehle NIEMALS selbst aus.
+# Kompatibel mit Bash 3.2 (macOS) und Bash 5 (Linux) — keine Bash-4-Features.
+#
+# Interne Aufrufe durch cmd.sh:
+#   cmd-core --log-exec <exit-code>                      Log-Eintrag nach Ausführung
+#   cmd-core --fix <session-id> <exit-code> <stderr>     Fehler-Loop (Korrektur)
+# Test-/Debug-Schnittstellen:
+#   cmd-core --denylist-check "<befehl>"                 Exit 0 = Treffer (Risiko hoch)
+#   Env-Overrides (nur für Tests): CMD_CLAUDE_BIN, CMD_SCHEMA_FILE, CMD_ALLOW_NO_TTY
+#
+# Flag-Verifikation gegen Claude Code 2.1.246 (2026-08-26):
+#   --tools ""      deaktiviert alle Tools ("Use \"\" to disable all tools")
+#   --json-schema   erzwingt Structured Output (Feld .structured_output im JSON)
+#   --max-turns     existiert in 2.1.x NICHT mehr und wird deshalb weggelassen;
+#                   --tools "" macht Mehr-Turn-Tool-Schleifen ohnehin unmöglich.
+
+VERSION="1.0.0"
+
+# ---------------------------------------------------------------------------
+# Pfade & Konstanten
+# ---------------------------------------------------------------------------
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/cmd"
+CONFIG_FILE="$CONFIG_DIR/config"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/cmd"
+LOG_FILE="$STATE_DIR/history.jsonl"
+CACHE_DIR="$HOME/.cache/cmd"   # Arbeitsverzeichnis für alle claude-Aufrufe (§4)
+SHARE_DIR="$HOME/.local/share/cmd"
+
+CLAUDE_BIN="${CMD_CLAUDE_BIN:-claude}"
+CMD_RESULT_FILE="${CMD_RESULT_FILE:-}"
+
+# Schema-Datei: Override → installierte Kopie → neben dem Skript (Entwicklung)
+SCHEMA_FILE="${CMD_SCHEMA_FILE:-}"
+if [ -z "$SCHEMA_FILE" ]; then
+  if [ -f "$SHARE_DIR/schema.json" ]; then
+    SCHEMA_FILE="$SHARE_DIR/schema.json"
+  else
+    SCHEMA_FILE="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/schema.json"
+  fi
+fi
+
+# Laufzeit-Zustand
+WORKDIR=""
+CLAUDE_PID=""
+SESSION_ID=""
+LAST_MODEL=""
+LAST_EFFORT=""
+ORIG_QUERY=""
+N_OPTS=0
+HINWEIS=""
+DEFAULT_ACTION="ausgeführt"
+FIX_MODE=0
+RESP_FILE=""
+CALL_ERR_MSG=""
+
+# ---------------------------------------------------------------------------
+# Ausgabe-Helfer
+# ---------------------------------------------------------------------------
+C_BOLD=""; C_DIM=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_RESET=""
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && command -v tput >/dev/null 2>&1; then
+  if [ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ] 2>/dev/null; then
+    C_BOLD=$(tput bold 2>/dev/null)
+    C_DIM=$(tput dim 2>/dev/null)
+    C_RED=$(tput setaf 1 2>/dev/null)
+    C_GREEN=$(tput setaf 2 2>/dev/null)
+    C_YELLOW=$(tput setaf 3 2>/dev/null)
+    C_RESET=$(tput sgr0 2>/dev/null)
+  fi
+fi
+
+info() { printf '%s%s%s\n' "$C_DIM" "$*" "$C_RESET"; }
+warn() { printf '%sWarnung:%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
+err()  { printf '%sFehler:%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
+die()  { err "$*"; exit 1; }
+
+# ---------------------------------------------------------------------------
+# Aufräumen & Signale
+# ---------------------------------------------------------------------------
+cleanup() {
+  [ -n "$CLAUDE_PID" ] && kill "$CLAUDE_PID" 2>/dev/null
+  [ -n "$WORKDIR" ] && rm -rf "$WORKDIR" 2>/dev/null
+}
+on_int() {
+  cleanup
+  # Bei Abbruch darf nichts zur Ausführung übrig bleiben:
+  if [ -n "$CMD_RESULT_FILE" ]; then
+    rm -f "$CMD_RESULT_FILE" "$CMD_RESULT_FILE.state" 2>/dev/null
+  fi
+  printf '\nAbgebrochen.\n' >&2
+  exit 130
+}
+trap cleanup EXIT
+trap on_int INT TERM
+
+make_workdir() {
+  WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/cmd-core.XXXXXX") || die "Konnte kein Temp-Verzeichnis anlegen."
+}
+
+# ---------------------------------------------------------------------------
+# Denylist (Defense-in-Depth, §7) — hebt Risiko auf »hoch«, senkt nie ab
+# ---------------------------------------------------------------------------
+deny_check() {
+  # $1 = auszuführender Befehl; Exit 0 = Treffer
+  local c="$1" p stripped
+  local pats
+  pats=(
+    '(^|[^[:alnum:]_.-])rm[[:space:]]+([^|;&]*[[:space:]])?-[[:alnum:]]{0,3}[rfRF][[:alnum:]]{0,3}([[:space:]]|$|[;&|)])'
+    '(^|[^[:alnum:]_.-])rm[[:space:]]+([^|;&]*[[:space:]])?--(force|recursive)([[:space:]=]|$|[;&|)])'
+    '(^|[^[:alnum:]_.-])dd([[:space:]]|$)'
+    '(^|[^[:alnum:]_.-])mkfs([.[:space:]]|$)'
+    '(^|[^[:alnum:]_.-])shred([[:space:]]|$)'
+    '(^|[^[:alnum:]_.-])truncate([[:space:]]|$)'
+    '(^|[^[:alnum:]_.-])(chmod|chown)[[:space:]]+([^|;&]*[[:space:]])?-[[:alnum:]]{0,3}R[[:alnum:]]{0,3}([[:space:]]|$|[;&|)])'
+    '(^|[^[:alnum:]_.-])(chmod|chown)[[:space:]]+([^|;&]*[[:space:]])?--recursive([[:space:]]|$|[;&|)])'
+    '(curl|wget)[^|]*\|[[:space:]]*(sudo[[:space:]]+)?(bash|sh|zsh|dash|ksh)([[:space:]]|$)'
+    '(^|[^[:alnum:]_.-])iptables[[:space:]]+[^|;&]*(-F([[:space:]]|$)|--flush)'
+    'git[[:space:]]+push[[:space:]]+([^|;&]*[[:space:]])?(--force|-f([[:space:]]|$))'
+    '(^|[^[:alnum:]_.-])(shutdown|reboot|poweroff|halt)([[:space:]]|$)'
+    '(^|[^[:alnum:]_.-])init[[:space:]]+[06]([[:space:]]|$)'
+  )
+  for p in "${pats[@]}"; do
+    printf '%s' "$c" | grep -Eq "$p" && return 0
+  done
+  # Schreiben auf Devices — /dev/null, /dev/stdout, /dev/stderr, /dev/tty
+  # und /dev/fd/N sind harmlos und werden vor der Prüfung entfernt.
+  if printf '%s' "$c" | grep -Eq '>[[:space:]]*/dev/'; then
+    stripped=$(printf '%s' "$c" | sed -E 's#>[[:space:]]*/dev/(null|stdout|stderr|tty|fd/[0-9]+)($|[^[:alnum:]/])#\2#g')
+    printf '%s' "$stripped" | grep -Eq '>[[:space:]]*/dev/' && return 0
+  fi
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# Konfiguration (§11)
+# ---------------------------------------------------------------------------
+set_config_defaults() {
+  DEFAULT_MODEL=haiku
+  ESCALATION_MODEL=opus
+  ESCALATION_EFFORT=max
+  FALLBACK_MODEL=sonnet
+  CMD_TIMEOUT=120
+  ESCALATION_TIMEOUT=300
+  EDITOR_OVERRIDE=""
+  MAX_OPTIONS=3
+}
+
+write_default_config() {
+  mkdir -p "$CONFIG_DIR" || die "Konnte $CONFIG_DIR nicht anlegen."
+  cat > "$CONFIG_FILE" <<'EOF'
+# Konfiguration für »cmd« — shell-sourcebares KEY=VALUE-Format.
+# Modelle: haiku | sonnet | opus | fable
+# Hinweis: fable zählt im Abo etwa doppelt so stark aufs Kontingent wie opus.
+
+DEFAULT_MODEL=haiku        # Modell für den Erstaufruf (schnell, günstig)
+ESCALATION_MODEL=opus      # Modell für '?' — Alternative: fable
+ESCALATION_EFFORT=max      # Effort für '?' (haiku: keiner; sonnet: low|medium|high|max; opus/fable: low|medium|high|xhigh|max)
+FALLBACK_MODEL=sonnet      # --fallback-model bei Überlastung
+CMD_TIMEOUT=120            # Sekunden je Claude-Aufruf
+ESCALATION_TIMEOUT=300     # Sekunden für '?'-Aufrufe
+EDITOR_OVERRIDE=           # leer = $EDITOR verwenden, Fallback vi
+MAX_OPTIONS=3              # 1–3
+EOF
+  info "Konfiguration angelegt: $CONFIG_FILE"
+}
+
+is_model() {
+  case "$1" in haiku|sonnet|opus|fable) return 0 ;; *) return 1 ;; esac
+}
+
+effort_valid() {
+  # $1 = Modell, $2 = Effort (§4: haiku nie; sonnet ohne xhigh; opus/fable alle)
+  case "$1" in
+    sonnet)     case "$2" in low|medium|high|max) return 0 ;; esac ;;
+    opus|fable) case "$2" in low|medium|high|xhigh|max) return 0 ;; esac ;;
+  esac
+  return 1
+}
+
+is_posint() {
+  case "$1" in ''|*[!0-9]*) return 1 ;; 0) return 1 ;; *) return 0 ;; esac
+}
+
+load_config() {
+  set_config_defaults
+  if [ ! -f "$CONFIG_FILE" ]; then
+    write_default_config
+  fi
+  if bash -n "$CONFIG_FILE" 2>/dev/null; then
+    . "$CONFIG_FILE"
+  else
+    warn "Config $CONFIG_FILE hat Syntaxfehler — verwende Defaults."
+    set_config_defaults
+    return
+  fi
+  is_model "$DEFAULT_MODEL"    || { warn "Ungültiges DEFAULT_MODEL »$DEFAULT_MODEL« — verwende haiku."; DEFAULT_MODEL=haiku; }
+  is_model "$ESCALATION_MODEL" || { warn "Ungültiges ESCALATION_MODEL »$ESCALATION_MODEL« — verwende opus."; ESCALATION_MODEL=opus; }
+  is_model "$FALLBACK_MODEL"   || { warn "Ungültiges FALLBACK_MODEL »$FALLBACK_MODEL« — verwende sonnet."; FALLBACK_MODEL=sonnet; }
+  if [ "$ESCALATION_MODEL" = haiku ]; then
+    ESCALATION_EFFORT=""   # haiku unterstützt kein --effort
+  elif ! effort_valid "$ESCALATION_MODEL" "$ESCALATION_EFFORT"; then
+    warn "Ungültiges ESCALATION_EFFORT »$ESCALATION_EFFORT« für $ESCALATION_MODEL — verwende max."
+    ESCALATION_EFFORT=max
+  fi
+  is_posint "$CMD_TIMEOUT"        || { warn "Ungültiges CMD_TIMEOUT »$CMD_TIMEOUT« — verwende 120."; CMD_TIMEOUT=120; }
+  is_posint "$ESCALATION_TIMEOUT" || { warn "Ungültiges ESCALATION_TIMEOUT »$ESCALATION_TIMEOUT« — verwende 300."; ESCALATION_TIMEOUT=300; }
+  case "$MAX_OPTIONS" in
+    1|2|3) : ;;
+    *) warn "Ungültiges MAX_OPTIONS »$MAX_OPTIONS« — verwende 3."; MAX_OPTIONS=3 ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Vorbedingungen (§2, §14)
+# ---------------------------------------------------------------------------
+check_tty() {
+  [ -n "${CMD_ALLOW_NO_TTY:-}" ] && return 0
+  if ! [ -t 0 ] || ! [ -t 1 ]; then
+    die "cmd benötigt ein interaktives Terminal (TTY). Nutzung in Pipes/Skripten wird nicht unterstützt."
+  fi
+}
+
+check_deps() {
+  command -v jq >/dev/null 2>&1 || die "jq fehlt. Installation: »sudo apt install jq« (Ubuntu) bzw. »brew install jq« (macOS)."
+  command -v "$CLAUDE_BIN" >/dev/null 2>&1 || die "Claude Code CLI (»claude«) nicht gefunden. Installation: https://claude.com/claude-code — danach »claude« starten und mit /login einloggen."
+  [ -f "$SCHEMA_FILE" ] || die "Schema-Datei nicht gefunden: $SCHEMA_FILE (install.sh ausführen?)"
+}
+
+# ---------------------------------------------------------------------------
+# Prompts (§5)
+# ---------------------------------------------------------------------------
+get_os_info() {
+  local u; u=$(uname -s 2>/dev/null)
+  case "$u" in
+    Darwin) printf 'macOS %s' "$(sw_vers -productVersion 2>/dev/null || echo '?')" ;;
+    Linux)
+      if command -v lsb_release >/dev/null 2>&1; then
+        lsb_release -ds 2>/dev/null
+      elif [ -r /etc/os-release ]; then
+        sed -n 's/^PRETTY_NAME="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' /etc/os-release | head -n 1
+      else
+        printf 'Linux %s' "$(uname -r 2>/dev/null)"
+      fi ;;
+    *) printf '%s' "${u:-unbekannt}" ;;
+  esac
+}
+
+build_prompts() {
+  SYSTEM_PROMPT="Du bist ein Generator für Shell-Einzeiler. Du übersetzt eine natürlichsprachliche Anfrage in ausführbare Shell-Befehle.
+
+Regeln:
+- Antworte ausschließlich mit JSON gemäß dem vorgegebenen Schema — keine Prosa, keine Rückfragen, keine Markdown-Codeblöcke.
+- Das gilt für JEDE Nachricht der Session, auch für Verfeinerungen, Rückmeldungen und Korrekturen: Liefere immer den vollständigen JSON-Antwortvertrag neu, niemals eine Antwort wie »bereits beantwortet«.
+- Du führst nichts aus und benutzt keine Tools; du schlägst nur Befehle vor.
+- Liefere 1 bis $MAX_OPTIONS Optionen; Option 1 ist deine beste Empfehlung. Weitere Optionen nur, wenn sie sich sinnvoll unterscheiden (anderes Tool, anderer Trade-off).
+- Bevorzuge Einzeiler. Verkettung mit && und Pipes ist erlaubt, mehrzeilige Skripte nicht.
+- Interaktive oder blockierende Befehle (Editor, Pager, top, tail -f …) nur, wenn die Anfrage es verlangt — dann mit Warnung im Feld \"hinweis\".
+- Beachte Betriebssystem und Shell aus dem Kontextblock, insbesondere GNU- vs. BSD-Unterschiede (z. B. sed -i '' unter macOS vs. sed -i unter GNU/Linux; abweichende Flags bei date, stat, du, ls).
+- Das Feld \"erklaerung\" beschreibt knapp, was der Befehl tut, einschließlich der wichtigen Flags.
+- Das Feld \"risiko\" stufst du ehrlich ein:
+  - \"niedrig\": rein lesend/anzeigend, keine Zustandsänderung.
+  - \"mittel\": verändert Dateien oder Systemzustand gezielt und praktisch umkehrbar (Datei anlegen, Paket installieren, Dienst neu starten). sudo-Befehle mindestens \"mittel\".
+  - \"hoch\": destruktiv oder schwer umkehrbar — Löschen/Überschreiben (rm -r/-f, dd, mkfs, shred, truncate), rekursive Rechte-/Eigentümeränderungen, Schreiben auf Devices, curl|sh-Muster, Firewall-Flush, git push --force, Shutdown/Reboot.
+- Das Feld \"hinweis\" nur bei Bedarf: Warnungen, Voraussetzungen (z. B. nicht installierte Tools), Alternativen."
+
+  local os shell
+  os=$(get_os_info)
+  shell="${CMD_SHELL_INFO:-$(basename "${SHELL:-unbekannt}")}"
+  MAIN_PROMPT="Kontext:
+- Betriebssystem: $os
+- Shell: $shell
+- Aktuelles Arbeitsverzeichnis: $PWD
+
+Anfrage: $ORIG_QUERY"
+
+  ESCALATE_PROMPT="Erkläre die vorgeschlagenen Optionen deutlich ausführlicher: jedes wichtige Flag, die genaue Wirkung, Risiken und sinnvolle Alternativen. Verbessere die Befehle, falls möglich. Antworte im selben JSON-Schema; die ausführlicheren Erklärungen gehören ins Feld \"erklaerung\"."
+}
+
+# ---------------------------------------------------------------------------
+# Claude-Aufruf mit Spinner & Timeout (§4)
+# ---------------------------------------------------------------------------
+call_claude() {
+  # $1 Timeout (s), $2 Modell, $3 Effort (""=keiner), $4 Resume-Session (""=frisch), $5 Prompt
+  local timeout_s="$1" model="$2" effort="$3" resume="$4" prompt="$5"
+  local errf rc timed_out="" start_ts elapsed frame=0 chars='|/-\' c
+  RESP_FILE="$WORKDIR/resp.json"
+  errf="$WORKDIR/resp.err"
+  CALL_ERR_MSG=""
+  mkdir -p "$CACHE_DIR" || { CALL_ERR_MSG="Konnte $CACHE_DIR nicht anlegen."; return 1; }
+
+  set -- -p --model "$model" --output-format json \
+    --json-schema "$(cat "$SCHEMA_FILE")" \
+    --append-system-prompt "$SYSTEM_PROMPT" \
+    --tools ""
+  [ "$FALLBACK_MODEL" != "$model" ] && set -- "$@" --fallback-model "$FALLBACK_MODEL"
+  [ -n "$effort" ] && set -- "$@" --effort "$effort"
+  [ -n "$resume" ] && set -- "$@" --resume "$resume"
+  set -- "$@" "$prompt"
+
+  # Arbeitsverzeichnis ~/.cache/cmd, damit weder CLAUDE.md noch Git-Status des
+  # aktuellen Verzeichnisses in den Kontext geladen werden (§4).
+  ( cd "$CACHE_DIR" && exec "$CLAUDE_BIN" "$@" ) >"$RESP_FILE" 2>"$errf" </dev/null &
+  CLAUDE_PID=$!
+
+  [ -t 2 ] || printf '… warte auf %s (max. %ss) …\n' "$model" "$timeout_s" >&2
+  start_ts=$SECONDS
+  while kill -0 "$CLAUDE_PID" 2>/dev/null; do
+    elapsed=$((SECONDS - start_ts))
+    if [ "$elapsed" -ge "$timeout_s" ]; then
+      kill "$CLAUDE_PID" 2>/dev/null
+      timed_out=1
+      break
+    fi
+    if [ -t 2 ]; then
+      c=${chars:$((frame % 4)):1}
+      printf '\r%s %s · %ss ' "$c" "$model" "$elapsed" >&2
+      frame=$((frame + 1))
+    fi
+    sleep 0.2
+  done
+  wait "$CLAUDE_PID" 2>/dev/null
+  rc=$?
+  CLAUDE_PID=""
+  [ -t 2 ] && printf '\r%*s\r' 40 '' >&2
+
+  if [ -n "$timed_out" ]; then
+    CALL_ERR_MSG="Zeitüberschreitung nach ${timeout_s}s ($model)."
+    return 1
+  fi
+  if [ "$rc" -ne 0 ]; then
+    CALL_ERR_MSG=$(tail -n 5 "$errf" 2>/dev/null)
+    [ -z "$CALL_ERR_MSG" ] && CALL_ERR_MSG="claude endete mit Exit-Code $rc."
+    if grep -qiE 'log ?in|logged out|authenticat|api.?key|oauth|credential|unauthorized' "$errf" 2>/dev/null; then
+      CALL_ERR_MSG="$CALL_ERR_MSG
+→ Vermutlich nicht eingeloggt: »claude« starten und /login ausführen."
+    fi
+    return 1
+  fi
+  if [ "$(jq -r '.is_error // false' "$RESP_FILE" 2>/dev/null)" = "true" ]; then
+    CALL_ERR_MSG="API-Fehler: $(jq -r '.result // "unbekannt"' "$RESP_FILE" 2>/dev/null | head -c 300)"
+    return 1
+  fi
+  return 0
+}
+
+ask_claude() {
+  # Wie call_claude, aber mit einmaligem Retry-Angebot (§14).
+  local r
+  call_claude "$@" && return 0
+  warn "Claude-Aufruf fehlgeschlagen: $CALL_ERR_MSG"
+  printf 'Nochmal versuchen? [Y/n] '
+  IFS= read -r r || r=n
+  case "$r" in
+    ""|y|Y|j|J)
+      call_claude "$@" && return 0
+      warn "Erneut fehlgeschlagen: $CALL_ERR_MSG"
+      return 1 ;;
+    *) return 1 ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Antwort parsen & validieren (§6, §13.5)
+# ---------------------------------------------------------------------------
+show_raw() {
+  local txt
+  err "Antwort entsprach nicht dem erwarteten Schema (kein gültiger structured_output)."
+  txt=$(jq -r '.result // empty' "$RESP_FILE" 2>/dev/null | head -c 1200)
+  if [ -n "$txt" ]; then
+    printf 'Antworttext des Modells:\n%s\n' "$txt" >&2
+  else
+    printf 'Rohantwort (gekürzt):\n' >&2
+    head -c 2000 "$RESP_FILE" >&2
+    printf '\n' >&2
+  fi
+}
+
+parse_response() {
+  # Exit 0 = ok; setzt SESSION_ID, N_OPTS, OPT_*-Arrays, HINWEIS.
+  # Bei Fehlschlag bleibt der bisherige Zustand (Optionen, Session) unberührt.
+  local f="$RESP_FILE" sid i
+  jq -e . "$f" >/dev/null 2>&1 || { show_raw; return 1; }
+  jq -e '.structured_output
+         | (.optionen | type == "array" and length >= 1 and length <= 3)
+           and all(.optionen[];
+                   (.befehl | type == "string" and length > 0)
+                   and (.erklaerung | type == "string")
+                   and (.risiko | IN("niedrig", "mittel", "hoch")))' \
+    "$f" >/dev/null 2>&1 || { show_raw; return 1; }
+  sid=$(jq -r '.session_id // empty' "$f")
+  [ -n "$sid" ] && SESSION_ID="$sid"
+  N_OPTS=$(jq -r '.structured_output.optionen | length' "$f")
+  [ "$N_OPTS" -gt "$MAX_OPTIONS" ] && N_OPTS=$MAX_OPTIONS
+  i=0
+  while [ "$i" -lt "$N_OPTS" ]; do
+    OPT_BEFEHL[$i]=$(jq -r ".structured_output.optionen[$i].befehl" "$f")
+    OPT_ERKL[$i]=$(jq -r ".structured_output.optionen[$i].erklaerung" "$f")
+    OPT_RISIKO[$i]=$(jq -r ".structured_output.optionen[$i].risiko" "$f")
+    if deny_check "${OPT_BEFEHL[$i]}"; then OPT_DENY[$i]=1; else OPT_DENY[$i]=0; fi
+    i=$((i + 1))
+  done
+  HINWEIS=$(jq -r '.structured_output.hinweis // empty' "$f")
+  return 0
+}
+
+eff_risk() {
+  # Effektives Risiko einer Option: Denylist hebt auf »hoch« an (§7).
+  if [ "${OPT_DENY[$1]}" = 1 ]; then echo hoch; else echo "${OPT_RISIKO[$1]}"; fi
+}
+
+# ---------------------------------------------------------------------------
+# Logging (§12) — append-only, ein JSON-Objekt pro Zeile
+# ---------------------------------------------------------------------------
+write_log() {
+  # $1 Modell, $2 Anfrage, $3 Befehl, $4 Aktion, $5 Exit-Code (""=null)
+  local ec_json="null"
+  [ -n "$5" ] && ec_json="$5"
+  mkdir -p "$STATE_DIR" 2>/dev/null
+  jq -cn \
+    --arg ts "$(date +%Y-%m-%dT%H:%M:%S%z)" \
+    --arg modell "$1" --arg anfrage "$2" --arg befehl "$3" --arg aktion "$4" \
+    --argjson exit_code "$ec_json" \
+    '{zeitstempel: $ts, modell: $modell, anfrage: $anfrage, befehl: $befehl, aktion: $aktion, exit_code: $exit_code}' \
+    >> "$LOG_FILE" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# Anzeige (§8)
+# ---------------------------------------------------------------------------
+show_options() {
+  local i=0 r label cols
+  cols=$(tput cols 2>/dev/null)
+  case "$cols" in ''|*[!0-9]*) cols=80 ;; esac
+  [ "$cols" -lt 40 ] && cols=80
+  printf '\n%s── Vorschläge (%s) ──%s\n' "$C_DIM" "$LAST_MODEL" "$C_RESET"
+  while [ "$i" -lt "$N_OPTS" ]; do
+    r=$(eff_risk "$i")
+    case "$r" in
+      niedrig) label="${C_GREEN}Risiko: niedrig${C_RESET}" ;;
+      mittel)  label="${C_YELLOW}Risiko: mittel${C_RESET}" ;;
+      hoch)
+        label="${C_RED}⚠ Risiko: HOCH${C_RESET}"
+        if [ "${OPT_DENY[$i]}" = 1 ] && [ "${OPT_RISIKO[$i]}" != hoch ]; then
+          label="$label ${C_RED}(Denylist)${C_RESET}"
+        fi ;;
+    esac
+    printf '\n%sOption %d%s · %s\n' "$C_BOLD" "$((i + 1))" "$C_RESET" "$label"
+    printf '%s' "$C_BOLD"
+    printf '%s\n' "${OPT_BEFEHL[$i]}" | sed 's/^/  /'
+    printf '%s' "$C_RESET$C_DIM"
+    printf '%s\n' "${OPT_ERKL[$i]}" | fold -s -w $((cols - 6)) | sed 's/^/  # /'
+    printf '%s' "$C_RESET"
+    i=$((i + 1))
+  done
+  if [ -n "$HINWEIS" ]; then
+    printf '\n%sHinweis:%s ' "$C_BOLD" "$C_RESET"
+    printf '%s\n' "$HINWEIS" | fold -s -w $((cols - 2))
+  fi
+}
+
+show_menu_help() {
+  cat <<EOF
+
+Eingaben:
+  Enter / y   Option 1 ausführen             n / q      abbrechen
+  2, 3        Option 2/3 ausführen           v/v2/v3    Option im Editor bearbeiten (v1 = v)
+  ?           ausführlichere Erklärungen vom Eskalationsmodell ($ESCALATION_MODEL)
+  m           Modell/Effort wechseln — frische Session mit der Original-Anfrage
+  h           diese Hilfe
+  <Freitext>  Anfrage verfeinern (gleiche Session, Modell: $LAST_MODEL)
+
+Risiko »hoch«: Ausführung erfordert das wörtliche Eintippen von »yes«.
+Config: $CONFIG_FILE · Log: $LOG_FILE · cmd $VERSION
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Bestätigung, Risiko-Gate & Abschluss (§8, §13)
+# ---------------------------------------------------------------------------
+write_state() {
+  # $1 Aktion, $2 Befehl — printf %q macht die Datei sicher source-bar.
+  {
+    printf 'SESSION_ID=%q\n' "$SESSION_ID"
+    printf 'LAST_MODEL=%q\n' "$LAST_MODEL"
+    printf 'LAST_EFFORT=%q\n' "$LAST_EFFORT"
+    printf 'ORIG_QUERY=%q\n' "$ORIG_QUERY"
+    printf 'PENDING_ACTION=%q\n' "$1"
+    printf 'PENDING_BEFEHL=%q\n' "$2"
+  } > "$CMD_RESULT_FILE.state"
+}
+
+finish() {
+  # $1 Befehl, $2 Aktion — schreibt Result + State, Exit 0. Die Ausführung
+  # übernimmt ausschließlich die Shell-Funktion cmd() (§3).
+  printf '%s\n' "$1" > "$CMD_RESULT_FILE" || die "Konnte Result-Datei nicht schreiben."
+  write_state "$2" "$1"
+  exit 0
+}
+
+confirm_exec() {
+  # $1 Befehl, $2 effektives Risiko, $3 Aktion. Return 1 = Gate nicht bestanden.
+  local befehl="$1" risk="$2" aktion="$3" r
+  if [ "$risk" = hoch ] || deny_check "$befehl"; then
+    printf '\n%s⚠  Risiko: HOCH — dieser Befehl kann Daten zerstören oder ist schwer umkehrbar.%s\n' "$C_RED" "$C_RESET"
+    printf '%sZum Ausführen wörtlich »yes« eintippen:%s ' "$C_RED" "$C_RESET"
+    IFS= read -r r || r=""
+    if [ "$r" != yes ]; then
+      info "Nicht bestätigt — zurück zum Menü."
+      return 1
+    fi
+  fi
+  finish "$befehl" "$aktion"
+}
+
+do_abort() {
+  write_log "$LAST_MODEL" "$ORIG_QUERY" "${OPT_BEFEHL[0]}" "abgebrochen" ""
+  : > "$CMD_RESULT_FILE"
+  info "Abgebrochen — nichts ausgeführt."
+  exit 0
+}
+
+# ---------------------------------------------------------------------------
+# Editor (§8.1)
+# ---------------------------------------------------------------------------
+edit_option() {
+  local idx="$1" f="$WORKDIR/edit.cmdtmp" ed newcmd orig_risk aktion r
+  printf '%s\n' "${OPT_BEFEHL[$idx]}" > "$f"
+  ed="${EDITOR_OVERRIDE:-${EDITOR:-vi}}"
+  # Kein Quoting von $ed: Editor-Angaben wie "code -w" sollen funktionieren.
+  $ed "$f" || { warn "Editor mit Fehler beendet — zurück zum Menü."; return 1; }
+  newcmd=$(cat "$f")
+  if [ -z "$(printf '%s' "$newcmd" | tr -d '[:space:]')" ]; then
+    info "Leerer Befehl — zurück zum Menü."
+    return 1
+  fi
+  printf '\nBearbeiteter Befehl:\n'
+  printf '%s' "$C_BOLD"
+  printf '%s\n' "$newcmd" | sed 's/^/  /'
+  printf '%s' "$C_RESET"
+  aktion="editiert+ausgeführt"
+  [ "$FIX_MODE" = 1 ] && aktion="fehler+korrigiert"
+  orig_risk=$(eff_risk "$idx")
+  if [ "$orig_risk" = hoch ] || deny_check "$newcmd"; then
+    confirm_exec "$newcmd" hoch "$aktion" || return 1
+  else
+    printf 'Ausführen? [Y/n] '
+    IFS= read -r r || r=n
+    case "$r" in
+      ""|y|Y|j|J) finish "$newcmd" "$aktion" ;;
+      *) info "Zurück zum Menü."; return 1 ;;
+    esac
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Modell-Dialog (§8.2), Eskalation & Freitext (§4)
+# ---------------------------------------------------------------------------
+model_dialog() {
+  local cur="$LAST_MODEL" sel m e name marker extra efforts
+  printf '\nModell wählen (aktuell: %s):\n' "$cur"
+  local i=1
+  for name in haiku sonnet opus fable; do
+    marker=" "; [ "$name" = "$cur" ] && marker="*"
+    extra=""; [ "$name" = fable ] && extra="   (zählt im Abo ca. doppelt so stark wie opus)"
+    printf '  %s %d) %s%s\n' "$marker" "$i" "$name" "$extra"
+    i=$((i + 1))
+  done
+  printf 'Auswahl [1-4 oder Name, Enter = %s]: ' "$cur"
+  IFS= read -r sel || return 1
+  case "$sel" in
+    "") m="$cur" ;;
+    1|haiku) m=haiku ;;
+    2|sonnet) m=sonnet ;;
+    3|opus) m=opus ;;
+    4|fable) m=fable ;;
+    *) warn "Ungültige Auswahl — zurück zum Menü."; return 1 ;;
+  esac
+  e=""
+  if [ "$m" != haiku ]; then
+    if [ "$m" = sonnet ]; then efforts="low/medium/high/max"; else efforts="low/medium/high/xhigh/max"; fi
+    printf 'Effort [%s, Enter = high]: ' "$efforts"
+    IFS= read -r e || e=""
+    [ -z "$e" ] && e=high
+    effort_valid "$m" "$e" || { warn "Ungültiger Effort »$e« — verwende high."; e=high; }
+  fi
+  info "Frische Anfrage an $m…"
+  # Frische Session (§4 »m«): kein --resume, Original-Anfrage, bisherige
+  # Session und Antwort werden verworfen.
+  if ask_claude "$CMD_TIMEOUT" "$m" "$e" "" "$MAIN_PROMPT"; then
+    parse_response || { info "Die bisherigen Optionen bleiben gültig."; return 1; }
+    LAST_MODEL="$m"; LAST_EFFORT="$e"
+    return 0
+  fi
+  return 1
+}
+
+escalate() {
+  local e="$ESCALATION_EFFORT"
+  info "Eskalation an $ESCALATION_MODEL…"
+  if ask_claude "$ESCALATION_TIMEOUT" "$ESCALATION_MODEL" "$e" "$SESSION_ID" "$ESCALATE_PROMPT"; then
+    parse_response || { info "Die bisherigen Optionen bleiben gültig."; return 1; }
+    LAST_MODEL="$ESCALATION_MODEL"; LAST_EFFORT="$e"
+    return 0
+  fi
+  return 1
+}
+
+followup() {
+  local p="Rückmeldung des Nutzers zu deinen Vorschlägen: $1
+
+Passe die Vorschläge entsprechend an und antworte erneut vollständig im vorgegebenen JSON-Schema (Feld \"optionen\", 1–$MAX_OPTIONS Einträge) — auch wenn dir die Anfrage bereits beantwortet erscheint."
+  if ask_claude "$CMD_TIMEOUT" "$LAST_MODEL" "$LAST_EFFORT" "$SESSION_ID" "$p"; then
+    parse_response || { info "Die bisherigen Optionen bleiben gültig."; return 1; }
+    return 0
+  fi
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# Menü-Loop (§8)
+# ---------------------------------------------------------------------------
+menu_loop() {
+  local inp mp
+  while :; do
+    case "$N_OPTS" in
+      1) mp='[Y/n/v/m/?/h]' ;;
+      2) mp='[Y/2/n/v/v2/m/?/h]' ;;
+      *) mp='[Y/2/3/n/v/v2/v3/m/?/h]' ;;
+    esac
+    printf '\n%s › ' "$mp"
+    IFS= read -r inp || do_abort
+    inp=$(printf '%s' "$inp" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    case "$inp" in
+      ""|y|Y)
+        confirm_exec "${OPT_BEFEHL[0]}" "$(eff_risk 0)" "$DEFAULT_ACTION" || : ;;
+      2)
+        if [ "$N_OPTS" -ge 2 ]; then confirm_exec "${OPT_BEFEHL[1]}" "$(eff_risk 1)" "$DEFAULT_ACTION" || :
+        else followup "$inp" && show_options; fi ;;
+      3)
+        if [ "$N_OPTS" -ge 3 ]; then confirm_exec "${OPT_BEFEHL[2]}" "$(eff_risk 2)" "$DEFAULT_ACTION" || :
+        else followup "$inp" && show_options; fi ;;
+      n|N|q) do_abort ;;
+      '?') escalate && show_options ;;
+      m|M) model_dialog && show_options ;;
+      v|v1) edit_option 0 || : ;;
+      v2)
+        if [ "$N_OPTS" -ge 2 ]; then edit_option 1 || :
+        else followup "$inp" && show_options; fi ;;
+      v3)
+        if [ "$N_OPTS" -ge 3 ]; then edit_option 2 || :
+        else followup "$inp" && show_options; fi ;;
+      h|H) show_menu_help ;;
+      *) followup "$inp" && show_options ;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Modi
+# ---------------------------------------------------------------------------
+usage() {
+  cat <<EOF
+cmd $VERSION — Shell-Befehle aus natürlicher Sprache (via Claude Code)
+
+Aufruf:
+  cmd <anfrage …>       z. B.: cmd zeige die 10 größten dateien hier
+  cmd                   fragt interaktiv nach der Anfrage
+  cmd -h | --help       diese Hilfe
+  cmd --version         Version anzeigen
+
+Alle Argumente werden als EINE Anfrage behandelt — Anführungszeichen sind
+optional. Enthält die Anfrage Shell-Metazeichen (| > < * ? ( ) ! \$), sind
+Quotes nötig: cmd 'zähle zeilen in *.md'
+
+Menü:  Enter/y = Option 1 ausführen · 2/3 = andere Option · n/q = abbrechen
+       v/v2/v3 = im Editor bearbeiten · ? = ausführlicher (Eskalationsmodell)
+       m = Modell wechseln · h = Hilfe · Freitext = Anfrage verfeinern
+Bei Risiko »hoch« muss wörtlich »yes« eingetippt werden.
+
+Dateien:
+  Konfiguration  $CONFIG_FILE
+  Verlauf        $LOG_FILE
+EOF
+}
+
+require_result_file() {
+  [ -n "$CMD_RESULT_FILE" ] || die "cmd-core ist nicht für den Direktaufruf gedacht — bitte die Shell-Funktion »cmd« verwenden (source cmd.sh, siehe install.sh)."
+}
+
+main() {
+  require_result_file
+  check_tty
+  check_deps
+  load_config
+  mkdir -p "$CACHE_DIR" "$STATE_DIR" 2>/dev/null
+  make_workdir
+
+  if [ $# -eq 0 ]; then
+    printf 'Anfrage: '
+    IFS= read -r ORIG_QUERY || exit 130
+    [ -z "$(printf '%s' "$ORIG_QUERY" | tr -d '[:space:]')" ] && die "Keine Anfrage angegeben."
+  else
+    ORIG_QUERY="$*"
+  fi
+
+  build_prompts
+  LAST_MODEL="$DEFAULT_MODEL"
+  LAST_EFFORT=""
+  SESSION_ID=""
+  DEFAULT_ACTION="ausgeführt"
+
+  ask_claude "$CMD_TIMEOUT" "$LAST_MODEL" "" "" "$MAIN_PROMPT" || exit 1
+  parse_response || exit 1
+  show_options
+  menu_loop
+}
+
+fix_main() {
+  # $1 Session-ID, $2 Exit-Code, $3 stderr-Datei (§9)
+  local sid="${1:-}" ec="${2:-1}" ef="${3:-}" r stderr_short p
+  require_result_file
+  check_tty
+  check_deps
+  load_config
+  make_workdir
+
+  if [ -f "$CMD_RESULT_FILE.state" ]; then
+    . "$CMD_RESULT_FILE.state"
+  fi
+  [ -n "$SESSION_ID" ] || SESSION_ID="$sid"
+  [ -n "$LAST_MODEL" ] || LAST_MODEL="$DEFAULT_MODEL"
+  local failed_cmd="${PENDING_BEFEHL:-}"
+  build_prompts
+
+  printf 'Fehler an Claude zur Korrektur schicken? [Y/n] '
+  IFS= read -r r || r=n
+  case "$r" in
+    ""|y|Y|j|J) : ;;
+    *) : > "$CMD_RESULT_FILE"; exit 0 ;;
+  esac
+
+  stderr_short=""
+  [ -f "$ef" ] && stderr_short=$(tail -n 60 "$ef" 2>/dev/null | tail -c 4000)
+  p="Der zuvor bestätigte Befehl ist bei der Ausführung fehlgeschlagen.
+Befehl: $failed_cmd
+Exit-Code: $ec
+stderr (gekürzt):
+$stderr_short
+
+Bitte analysiere den Fehler und liefere korrigierte Optionen im selben JSON-Schema."
+
+  ask_claude "$CMD_TIMEOUT" "$LAST_MODEL" "$LAST_EFFORT" "$SESSION_ID" "$p" || { : > "$CMD_RESULT_FILE"; exit 1; }
+  parse_response || exit 1
+  DEFAULT_ACTION="fehler+korrigiert"
+  FIX_MODE=1
+  show_options
+  menu_loop
+}
+
+log_exec_main() {
+  # $1 Exit-Code — schreibt den Log-Eintrag zur gerade erfolgten Ausführung.
+  [ -n "$CMD_RESULT_FILE" ] || exit 0
+  [ -f "$CMD_RESULT_FILE.state" ] || exit 0
+  command -v jq >/dev/null 2>&1 || exit 0
+  . "$CMD_RESULT_FILE.state"
+  write_log "${LAST_MODEL:-?}" "${ORIG_QUERY:-}" "${PENDING_BEFEHL:-}" "${PENDING_ACTION:-ausgeführt}" "${1:-0}"
+  exit 0
+}
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+  --version) printf 'cmd %s\n' "$VERSION"; exit 0 ;;
+  --denylist-check)
+    shift
+    if deny_check "$*"; then echo hoch; exit 0; else echo ok; exit 1; fi ;;
+  --log-exec) log_exec_main "${2:-0}" ;;
+  --fix) shift; fix_main "$@" ;;
+  *) main "$@" ;;
+esac
