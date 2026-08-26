@@ -28,6 +28,7 @@ cat > "$MOCK" <<'EOF'
 n=1
 while [ -e "$MOCK_DIR/call-$n.args" ]; do n=$((n+1)); done
 printf '%s\n' "$@" > "$MOCK_DIR/call-$n.args"
+printf 'MAX_THINKING_TOKENS=%s\n' "${MAX_THINKING_TOKENS-unset}" > "$MOCK_DIR/call-$n.env"
 [ -n "$MOCK_SLEEP" ] && sleep "$MOCK_SLEEP"
 if [ -n "$MOCK_EXIT" ] && [ "$MOCK_EXIT" != 0 ]; then
   echo "mock error: please log in" >&2
@@ -65,7 +66,7 @@ printf '{"type":"result","is_error":false,"session_id":"%s","result":"Bereits be
 RES="$SCRATCH/result"
 OUT="$SCRATCH/out"; ERR="$SCRATCH/err"
 
-reset_calls() { rm -f "$MOCK_DIR"/call-*.args "$RES" "$RES.state"; : > "$RES"; }
+reset_calls() { rm -f "$MOCK_DIR"/call-*.args "$MOCK_DIR"/call-*.env "$RES" "$RES.state"; : > "$RES"; }
 
 run_core() {
   # $1 = Eingabe (an stdin), $2 = MOCK_RESPONSE-Datei, danach cmd-core-Argumente.
@@ -262,6 +263,9 @@ A2="$MOCK_DIR/call-2.args"
 [ -f "$A2" ] && grep -qx -- '--resume' "$A2" && grep -qx 'opus' "$A2" \
   && grep -qx -- '--effort' "$A2" && grep -qx 'max' "$A2"
 check "»?«: Eskalation mit --model opus --effort max --resume" $?
+grep -qx 'MAX_THINKING_TOKENS=0' "$MOCK_DIR/call-1.env" \
+  && grep -qx 'MAX_THINKING_TOKENS=unset' "$MOCK_DIR/call-2.env"
+check "Thinking: aus ohne Effort (Erstaufruf), an bei Eskalation" $?
 
 # ---------------------------------------------------------------------------
 # 16: »m« → frische Session (kein resume); haiku ohne Effort-Abfrage

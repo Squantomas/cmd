@@ -24,7 +24,7 @@
 #   --max-turns     existiert in 2.1.x NICHT mehr und wird deshalb weggelassen;
 #                   --tools "" macht Mehr-Turn-Tool-Schleifen ohnehin unmöglich.
 
-VERSION="1.1.0"
+VERSION="1.1.1"
 
 # ---------------------------------------------------------------------------
 # Pfade & Konstanten
@@ -306,9 +306,15 @@ call_claude() {
   [ -n "$resume" ] && set -- "$@" --resume "$resume"
   set -- "$@" "$prompt"
 
+  # Ohne explizites Effort (Erstaufruf, cmdf, Freitext, Fehler-Loop) wird
+  # Extended Thinking deaktiviert: haikus Thinking-Tokens kosten sonst über
+  # die Hälfte der Latenz (gemessen: ~16 s → ~8 s). Aufrufe MIT Effort
+  # (Eskalation, m-Dialog) behalten Thinking — da ist Gründlichkeit der Zweck.
+  set -- "$CLAUDE_BIN" "$@"
+  [ -z "$effort" ] && set -- env MAX_THINKING_TOKENS=0 "$@"
   # Arbeitsverzeichnis ~/.cache/cmd, damit weder CLAUDE.md noch Git-Status des
   # aktuellen Verzeichnisses in den Kontext geladen werden (§4).
-  ( cd "$CACHE_DIR" && exec "$CLAUDE_BIN" "$@" ) >"$RESP_FILE" 2>"$errf" </dev/null &
+  ( cd "$CACHE_DIR" && exec "$@" ) >"$RESP_FILE" 2>"$errf" </dev/null &
   CLAUDE_PID=$!
 
   [ -t 2 ] || printf '… warte auf %s (max. %ss) …\n' "$model" "$timeout_s" >&2

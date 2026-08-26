@@ -136,6 +136,12 @@ shell-sourcebares `KEY=VALUE`-Format:
 | `EDITOR_OVERRIDE` | *(leer)* | leer = `$EDITOR` verwenden, Fallback `vi` |
 | `MAX_OPTIONS` | `3` | 1–3 angezeigte Optionen |
 
+**Performance:** Für Aufrufe ohne explizites Effort (Erstaufruf, `cmdf`,
+Freitext-Verfeinerung, Fehler-Loop) deaktiviert `cmd` das Extended Thinking
+des Modells (`MAX_THINKING_TOKENS=0`) — das halbiert die Antwortzeit etwa,
+ohne die Qualität einfacher Einzeiler zu beeinträchtigen. Die `?`-Eskalation
+und per `m` gewählte Modelle mit Effort behalten ihr Thinking.
+
 Modelle: `haiku`, `sonnet`, `opus`, `fable` (Stand Aug 2026; `fable` zählt im
 Abo etwa doppelt so stark aufs Kontingent wie `opus`). Effort nur, wo das
 Modell es unterstützt: `haiku` nie; `sonnet` `low|medium|high|max`;
