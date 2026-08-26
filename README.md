@@ -57,6 +57,21 @@ cmd -h                   # Hilfe
 cmd --version
 ```
 
+### Fast-Modus: `cmdf`
+
+```sh
+cmdf zeige die 10 größten dateien in diesem verzeichnis
+```
+
+`cmdf` ist auf Geschwindigkeit optimiert: Es fordert **genau eine Option** mit
+extrem knapper Erklärung an und führt sie bei Risiko „niedrig" oder „mittel"
+**sofort und ohne Nachfrage** aus (der Befehl wird dabei angezeigt und landet
+wie üblich in History und Log). Nur bei Risiko „hoch" — auch wenn die
+Denylist es dorthin anhebt — greift das gewohnte `yes`-Gate. Menü, Editor,
+Eskalation und Modellwechsel gibt es in `cmdf` nicht; dafür ist `cmd` da.
+Der Fehler-Loop funktioniert auch hier: Schlägt der Befehl fehl, bietet
+`cmdf` die Korrektur an.
+
 **Quoting:** Alle Argumente werden als *eine* Anfrage behandelt —
 Anführungszeichen sind optional. Enthält die Anfrage Shell-Metazeichen
 (`| > < * ? ( ) ! $`), sind Quotes nötig:
@@ -86,7 +101,9 @@ korrigierte Optionen — auch dort wird nie ohne Bestätigung ausgeführt.
 
 - **Risiko-Gate:** Bei Risiko „hoch" genügt Enter nicht — es muss wörtlich
   `yes` eingetippt werden. Das gilt für jeden Ausführungspfad (Direktwahl,
-  nach dem Editor, im Fehler-Loop).
+  nach dem Editor, im Fehler-Loop — und auch im Fast-Modus `cmdf`).
+- **`cmdf` führt bewusst ohne Nachfrage aus** (nur bei Risiko
+  „niedrig"/„mittel"): Wer jede Ausführung bestätigen will, nutzt `cmd`.
 - **Denylist:** Unabhängig von Claudes Einstufung prüft `cmd-core` jeden
   Befehl gegen eine fest einprogrammierte Musterliste (`rm -r/-f`, `dd`,
   `mkfs`, `shred`, `truncate`, `chmod/chown -R`, Schreiben auf `/dev/…`,

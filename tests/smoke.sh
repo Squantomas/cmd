@@ -58,6 +58,7 @@ resp cd.json '{"optionen":[{"befehl":"cd /","erklaerung":"Wechselt ins Wurzelver
 resp hoch.json '{"optionen":[{"befehl":"rm -rf /tmp/cmdtest-x","erklaerung":"Löscht rekursiv.","risiko":"hoch"}]}'
 resp deny.json '{"optionen":[{"befehl":"rm -rf /tmp/leise","erklaerung":"Falsch als harmlos deklariert.","risiko":"niedrig"}]}'
 resp fix.json '{"optionen":[{"befehl":"echo KORRIGIERT","erklaerung":"Korrigierte Variante.","risiko":"niedrig"}]}'
+resp mittel.json '{"optionen":[{"befehl":"touch /tmp/cmdtest-fast","erklaerung":"Legt eine Datei an.","risiko":"mittel"}]}'
 printf 'kein json {{{\n' > "$SCRATCH/broken.json"
 printf '{"type":"result","is_error":false,"session_id":"%s","result":"Bereits beantwortet — keine neue Anfrage."}\n' "$SID" > "$SCRATCH/noresult.json"
 
@@ -358,6 +359,37 @@ rc=$?
 check "claude-Fehler: Meldung mit Login-Hinweis, Exit ≠ 0" $?
 
 # ---------------------------------------------------------------------------
+# Fast-Modus (cmdf / cmd-core --fast)
+# ---------------------------------------------------------------------------
+reset_calls
+run_core '' exec.json --fast sag hallo
+rc=$?
+[ "$rc" -eq 0 ] && [ "$(cat "$RES")" = 'echo HALLO-ROUNDTRIP' ] && grep -q 'echo HALLO-ROUNDTRIP' "$OUT"
+check "Fast: Risiko niedrig wird ohne Nachfrage ausgeführt" $?
+grep -q 'GENAU EINE' "$MOCK_DIR/call-1.args"
+check "Fast: System-Prompt fordert genau eine Option" $?
+
+reset_calls
+run_core '' mittel.json --fast lege datei an
+[ "$(cat "$RES")" = 'touch /tmp/cmdtest-fast' ]
+check "Fast: Risiko mittel wird ohne Nachfrage ausgeführt" $?
+
+reset_calls
+run_core '' hoch.json --fast loesche alles
+[ ! -s "$RES" ] && grep -q 'yes' "$OUT"
+check "Fast: Risiko hoch führt NICHT sofort aus (yes-Gate)" $?
+reset_calls
+run_core 'yes
+' hoch.json --fast loesche alles
+[ "$(cat "$RES")" = 'rm -rf /tmp/cmdtest-x' ]
+check "Fast: hoch + wörtliches »yes« führt aus" $?
+
+reset_calls
+run_core '' deny.json --fast loesche leise
+[ ! -s "$RES" ]
+check "Fast: Denylist-Treffer erzwingt Gate trotz deklariertem »niedrig«" $?
+
+# ---------------------------------------------------------------------------
 # 24–26: Roundtrip über die Shell-Funktion cmd() in bash (und zsh, falls da)
 # ---------------------------------------------------------------------------
 mkdir -p "$SCRATCH/.local/bin" "$SCRATCH/.local/share/cmd"
@@ -391,6 +423,15 @@ if command -v zsh >/dev/null 2>&1; then
 else
   printf 'skip - zsh nicht installiert\n'
 fi
+
+# cmdf-Roundtrip: ohne jede Eingabe direkt ausgeführt
+rm -f "$MOCK_DIR"/call-*.args
+printf '' | env HOME="$SCRATCH" PATH="$SCRATCH/.local/bin:$PATH" \
+  CMD_ALLOW_NO_TTY=1 CMD_CLAUDE_BIN="$MOCK" MOCK_DIR="$MOCK_DIR" \
+  MOCK_RESPONSE="$SCRATCH/exec.json" NO_COLOR=1 \
+  bash -c ". '$SRC_DIR/cmd.sh'; cmdf sag hallo" > "$OUT" 2> "$ERR"
+grep -q 'HALLO-ROUNDTRIP' "$OUT" && grep -q 'exit 0' "$OUT"
+check "bash-Roundtrip: cmdf führt ohne Nachfrage aus" $?
 
 # ---------------------------------------------------------------------------
 printf '\n%d Tests bestanden, %d fehlgeschlagen.\n' "$PASS" "$FAIL"

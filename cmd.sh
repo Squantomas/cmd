@@ -1,12 +1,17 @@
-# cmd.sh — definiert die Shell-Funktion cmd() für zsh UND bash.
+# cmd.sh — definiert die Shell-Funktionen cmd() und cmdf() für zsh UND bash.
 # Wird aus ~/.zshrc bzw. ~/.bashrc gesourct (siehe install.sh).
 #
 # Architektur (§3 der Spezifikation): cmd-core generiert und bestätigt den
-# Befehl, führt ihn aber nie aus. Diese Funktion liest den bestätigten Befehl
-# aus einer mktemp-Datei und führt ihn per eval in der AKTUELLEN Shell aus —
-# dadurch wirken cd, export usw., und der Befehl landet in der Shell-History.
+# Befehl, führt ihn aber nie aus. Diese Funktionen lesen den bestätigten
+# Befehl aus einer mktemp-Datei und führen ihn per eval in der AKTUELLEN
+# Shell aus — dadurch wirken cd, export usw., und der Befehl landet in der
+# Shell-History.
+#
+# cmd  — 1–3 Optionen, Ausführung immer erst nach Bestätigung im Menü.
+# cmdf — Fast-Modus: genau eine Option; Risiko niedrig/mittel wird sofort
+#        ausgeführt, nur »hoch« fragt mit dem wörtlichen yes-Gate nach.
 
-cmd() {
+_cmd_run() {
     local core result stderrf rc line ec sid final shellinfo dim rst
 
     if command -v cmd-core >/dev/null 2>&1; then
@@ -83,3 +88,6 @@ cmd() {
     rm -f "$result" "$result.state" "$stderrf"
     return "$final"
 }
+
+cmd()  { _cmd_run "$@"; }
+cmdf() { _cmd_run --fast "$@"; }
